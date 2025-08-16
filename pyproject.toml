@@ -70,6 +70,7 @@ dependencies = [
   "whitenoise~=6.9",
   "whoosh-reloaded>=2.7.5",
   "zxing-cpp~=2.3.0",
+  "boto3>=1.34,<2",
 ]
 
 optional-dependencies.mariadb = [

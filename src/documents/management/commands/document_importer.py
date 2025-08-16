@@ -24,7 +24,6 @@ from django.db.models.signals import m2m_changed
 from django.db.models.signals import post_save
 from filelock import FileLock
 
-from documents.file_handling import create_source_path_directory
 from documents.management.commands.mixins import CryptMixin
 from documents.models import Correspondent
 from documents.models import CustomField
@@ -382,15 +381,25 @@ class Command(CryptMixin, BaseCommand):
             document.storage_type = Document.STORAGE_TYPE_UNENCRYPTED
 
             with FileLock(settings.MEDIA_LOCK):
-                if Path(document.source_path).is_file():
-                    raise FileExistsError(document.source_path)
+                # Check if source file already exists
+                if document.source_file.exists:
+                    raise FileExistsError(f"Document source already exists: {document.filename}")
 
-                create_source_path_directory(document.source_path)
+                # Generate filename if not set
+                if not document.filename:
+                    document.filename = str(document.generate_unique_filename())
 
-                copy_file_with_basic_stats(document_path, document.source_path)
+                # Write source document to storage
+                with open(document_path, 'rb') as f:
+                    document.source_file.write(f)
 
                 if thumbnail_path:
                     if thumbnail_path.suffix in {".png", ".PNG"}:
+                        # Convert PNG thumbnails to WebP
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(suffix='.webp', delete=False) as tmp:
+                            tmp_path = tmp.name
+                        
                         run_convert(
                             density=300,
                             scale="500x5000>",
@@ -399,20 +408,28 @@ class Command(CryptMixin, BaseCommand):
                             trim=False,
                             auto_orient=True,
                             input_file=f"{thumbnail_path}[0]",
-                            output_file=str(document.thumbnail_path),
+                            output_file=tmp_path,
                         )
+                        
+                        # Write converted thumbnail to storage
+                        with open(tmp_path, 'rb') as f:
+                            document.thumbnail_file.write(f)
+                        
+                        # Clean up temp file
+                        Path(tmp_path).unlink(missing_ok=True)
                     else:
-                        copy_file_with_basic_stats(
-                            thumbnail_path,
-                            document.thumbnail_path,
-                        )
+                        # Write thumbnail directly to storage
+                        with open(thumbnail_path, 'rb') as f:
+                            document.thumbnail_file.write(f)
 
                 if archive_path:
-                    create_source_path_directory(document.archive_path)
-                    # TODO: this assumes that the export is valid and
-                    #  archive_filename is present on all documents with
-                    #  archived files
-                    copy_file_with_basic_stats(archive_path, document.archive_path)
+                    # Generate archive filename if not set
+                    if not document.archive_filename:
+                        document.archive_filename = str(document.generate_unique_filename(archive_filename=True))
+                    
+                    # Write archive to storage
+                    with open(archive_path, 'rb') as f:
+                        document.archive_file.write(f)
 
             document.save()
 

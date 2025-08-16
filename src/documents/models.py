@@ -1,6 +1,10 @@
 import datetime
+import hashlib
+import logging
+import os
 from pathlib import Path
 from typing import Final
+from typing import Optional
 
 import pathvalidate
 from celery import states
@@ -24,6 +28,11 @@ from django_softdelete.models import SoftDeleteModel
 
 from documents.data_models import DocumentSource
 from documents.parsers import get_default_file_extension
+from documents.storage import get_storage_backend
+from documents.storage.file_abstraction import DocumentFile
+from documents.storage.materialize import materialize_to_temp
+
+logger = logging.getLogger("paperless.models")
 
 
 class ModelWithOwner(models.Model):
@@ -306,34 +315,8 @@ class Document(SoftDeleteModel, ModelWithOwner):
         return res
 
     @property
-    def source_path(self) -> Path:
-        if self.filename:
-            fname = str(self.filename)
-        else:
-            fname = f"{self.pk:07}{self.file_type}"
-            if self.storage_type == self.STORAGE_TYPE_GPG:
-                fname += ".gpg"  # pragma: no cover
-
-        return (settings.ORIGINALS_DIR / Path(fname)).resolve()
-
-    @property
-    def source_file(self):
-        return Path(self.source_path).open("rb")
-
-    @property
     def has_archive_version(self) -> bool:
         return self.archive_filename is not None
-
-    @property
-    def archive_path(self) -> Path | None:
-        if self.has_archive_version:
-            return (settings.ARCHIVE_DIR / Path(str(self.archive_filename))).resolve()
-        else:
-            return None
-
-    @property
-    def archive_file(self):
-        return Path(self.archive_path).open("rb")
 
     def get_public_filename(self, *, archive=False, counter=0, suffix=None) -> str:
         """
@@ -359,22 +342,291 @@ class Document(SoftDeleteModel, ModelWithOwner):
         return get_default_file_extension(self.mime_type)
 
     @property
-    def thumbnail_path(self) -> Path:
+    def created_date(self):
+        return self.created
+
+    def storage_key_source(self) -> Optional[str]:
+        """Get storage key for original document."""
+        if self.filename:
+            return f"documents/originals/{self.filename}"
+        return None
+
+    def storage_key_archive(self) -> Optional[str]:
+        """Get storage key for archive document."""
+        if self.archive_filename:
+            return f"documents/archive/{self.archive_filename}"
+        return None
+
+    def storage_key_thumbnail(self) -> str:
+        """Get storage key for thumbnail."""
         webp_file_name = f"{self.pk:07}.webp"
         if self.storage_type == self.STORAGE_TYPE_GPG:
             webp_file_name += ".gpg"
+        return f"documents/thumbnails/{webp_file_name}"
 
-        webp_file_path = settings.THUMBNAIL_DIR / Path(webp_file_name)
+    def generate_filename(
+        self,
+        *,
+        counter=0,
+        append_gpg=True,
+        archive_filename=False,
+    ) -> Path:
+        """Generate a filename for this document based on templates and settings."""
+        from documents.templating.filepath import validate_filepath_template_and_render
+        from documents.templating.utils import convert_format_str_to_template_format
 
-        return webp_file_path.resolve()
+        base_path: Optional[Path] = None
+
+        def format_filename(document, template_str: str) -> Optional[str]:
+            rendered_filename = validate_filepath_template_and_render(
+                template_str,
+                document,
+            )
+            if rendered_filename is None:
+                return None
+
+            # Apply this setting.  It could become a filter in the future (or users could use |default)
+            if settings.FILENAME_FORMAT_REMOVE_NONE:
+                rendered_filename = rendered_filename.replace("/-none-/", "/")
+                rendered_filename = rendered_filename.replace(" -none-", "")
+                rendered_filename = rendered_filename.replace("-none-", "")
+                rendered_filename = rendered_filename.strip(os.sep)
+
+            rendered_filename = rendered_filename.replace(
+                "-none-",
+                "none",
+            )  # backward compatibility
+
+            return rendered_filename
+
+        # Determine the source of the format string
+        if self.storage_path is not None:
+            filename_format = self.storage_path.path
+        elif settings.FILENAME_FORMAT is not None:
+            # Maybe convert old to new style
+            filename_format = convert_format_str_to_template_format(
+                settings.FILENAME_FORMAT,
+            )
+        else:
+            filename_format = None
+
+        # If we have one, render it
+        if filename_format is not None:
+            rendered_path: Optional[str] = format_filename(self, filename_format)
+            if rendered_path:
+                base_path = Path(rendered_path)
+
+        counter_str = f"_{counter:02}" if counter else ""
+        filetype_str = ".pdf" if archive_filename else self.file_type
+
+        if base_path:
+            # Split the path into directory and filename parts
+            directory = base_path.parent
+            # Use the full name (not just stem) as the base filename
+            base_filename = base_path.name
+
+            # Build the final filename with counter and filetype
+            final_filename = f"{base_filename}{counter_str}{filetype_str}"
+
+            # If we have a directory component, include it
+            if directory != Path("."):
+                full_path = directory / final_filename
+            else:
+                full_path = Path(final_filename)
+        else:
+            # No template, use document ID
+            final_filename = f"{self.pk:07}{counter_str}{filetype_str}"
+            full_path = Path(final_filename)
+
+        # Add GPG extension if needed
+        if append_gpg and self.storage_type == self.STORAGE_TYPE_GPG:
+            full_path = full_path.with_suffix(full_path.suffix + ".gpg")
+
+        return full_path
+
+    def generate_unique_filename(self, *, archive_filename=False) -> Path:
+        """
+        Generates a unique filename for this document.
+
+        The returned filename is guaranteed to be either the current filename
+        of the document if unchanged, or a new filename that does not correspondent
+        to any existing files. The function will append _01, _02, etc to the
+        filename before the extension to avoid conflicts.
+
+        If archive_filename is True, return a unique archive filename instead.
+        """
+        storage = get_storage_backend()
+
+        # Determine the storage prefix and current filename
+        if archive_filename:
+            old_filename = Path(self.archive_filename) if self.archive_filename else None
+            storage_prefix = "documents/archive/"
+        else:
+            old_filename = Path(self.filename) if self.filename else None
+            storage_prefix = "documents/originals/"
+
+        # If generating archive filenames, try to make a name that is similar to
+        # the original filename first.
+        if archive_filename and self.filename:
+            # Generate the full path using the same logic as generate_filename
+            base_generated = self.generate_filename(archive_filename=archive_filename)
+
+            # Try to create a simple PDF version based on the original filename
+            # but preserve any directory structure from the template
+            if base_generated.parent != Path("."):
+                # Has directory structure, preserve it
+                simple_pdf_name = base_generated.parent / (Path(self.filename).stem + ".pdf")
+            else:
+                # No directory structure
+                simple_pdf_name = Path(Path(self.filename).stem + ".pdf")
+
+            # Check using storage backend instead of filesystem
+            # Use forward slashes for storage keys (cross-platform compatibility)
+            simple_pdf_key = str(simple_pdf_name).replace(os.sep, "/")
+            if simple_pdf_name == old_filename or not storage.exists(storage_prefix + simple_pdf_key):
+                return simple_pdf_name
+
+        counter = 0
+
+        while True:
+            new_filename = self.generate_filename(
+                counter=counter,
+                archive_filename=archive_filename,
+            )
+            if new_filename == old_filename:
+                # still the same as before.
+                return new_filename
+
+            # Use storage backend to check for existence
+            # Use forward slashes for storage keys (cross-platform compatibility)
+            new_filename_key = str(new_filename).replace(os.sep, "/")
+            if storage.exists(storage_prefix + new_filename_key):
+                counter += 1
+            else:
+                return new_filename
+
+    def rename_files(self):
+        """
+        Rename document files in storage based on current naming rules.
+        
+        This generates new unique filenames and renames the files in storage,
+        with automatic rollback on failure.
+        
+        Returns:
+            Tuple of (files_renamed: bool, old_filename, old_archive_filename)
+        """
+        from documents.storage import get_storage_backend
+        storage = get_storage_backend()
+        
+        # Save current state for potential rollback
+        old_filename = self.filename
+        old_archive_filename = self.archive_filename
+        
+        # Generate new filenames
+        new_filename = str(self.generate_unique_filename())
+        new_archive_filename = str(self.generate_unique_filename(archive_filename=True)) if self.has_archive_version else None
+        
+        # Check if anything needs to be renamed
+        move_source = old_filename != new_filename
+        move_archive = self.has_archive_version and old_archive_filename != new_archive_filename
+        
+        if not move_source and not move_archive:
+            return False, old_filename, old_archive_filename
+        
+        # Save old keys for rollback
+        old_source_key = self.storage_key_source() if move_source else None
+        old_archive_key = self.storage_key_archive() if move_archive else None
+        
+        # Initialize new keys to None (prevents UnboundLocalError in except block)
+        new_source_key = None
+        new_archive_key = None
+        
+        try:
+            # Update filenames first (needed to get new storage keys)
+            if move_source:
+                self.filename = new_filename
+            if move_archive:
+                self.archive_filename = new_archive_filename
+            
+            # Get new storage keys
+            new_source_key = self.storage_key_source() if move_source else None
+            new_archive_key = self.storage_key_archive() if move_archive else None
+            
+            # Perform the actual renames
+            if move_source:
+                # Validate that target doesn't exist
+                if storage.exists(new_source_key):
+                    raise FileExistsError(f"Target file already exists: {new_source_key}")
+                storage.rename(old_source_key, new_source_key)
+                # Clear cached file object
+                if hasattr(self, '_source_file'):
+                    del self._source_file
+                    
+            if move_archive:
+                # Validate that target doesn't exist
+                if storage.exists(new_archive_key):
+                    raise FileExistsError(f"Target file already exists: {new_archive_key}")
+                storage.rename(old_archive_key, new_archive_key)
+                # Clear cached file object
+                if hasattr(self, '_archive_file'):
+                    del self._archive_file
+                    
+            return True, old_filename, old_archive_filename
+            
+        except Exception as e:
+            # Rollback on any failure
+            logger.warning(f"Failed to rename files for document {self.id}: {e}, rolling back")
+            
+            # Restore original filenames
+            self.filename = old_filename
+            self.archive_filename = old_archive_filename
+            
+            # Try to restore files if they were moved
+            if move_source and old_source_key and new_source_key:
+                try:
+                    if storage.exists(new_source_key):
+                        storage.rename(new_source_key, old_source_key)
+                except Exception:
+                    pass  # Best effort rollback
+                    
+            if move_archive and old_archive_key and new_archive_key:
+                try:
+                    if storage.exists(new_archive_key):
+                        storage.rename(new_archive_key, old_archive_key)
+                except Exception:
+                    pass  # Best effort rollback
+                    
+            # Clear any cached file objects to ensure consistency
+            if hasattr(self, '_source_file'):
+                del self._source_file
+            if hasattr(self, '_archive_file'):
+                del self._archive_file
+                
+            raise e
+    
+    # File abstraction properties for storage-agnostic access
+    @property
+    def source_file(self):
+        """Get source file abstraction for storage-agnostic operations."""
+        if not hasattr(self, '_source_file'):
+            self._source_file = DocumentFile(self.storage_key_source(), is_encrypted = self.storage_type == self.STORAGE_TYPE_GPG)
+        return self._source_file
+
+    @property
+    def archive_file(self):
+        """Get archive file abstraction, or None if no archive exists."""
+        if not self.has_archive_version:
+            return None
+        if not hasattr(self, '_archive_file'):
+            self._archive_file = DocumentFile(self.storage_key_archive(), is_encrypted = self.storage_type == self.STORAGE_TYPE_GPG)
+        return self._archive_file
 
     @property
     def thumbnail_file(self):
-        return Path(self.thumbnail_path).open("rb")
-
-    @property
-    def created_date(self):
-        return self.created
+        """Get thumbnail file abstraction for storage-agnostic operations."""
+        if not hasattr(self, '_thumbnail_file'):
+            self._thumbnail_file = DocumentFile(self.storage_key_thumbnail(), is_encrypted = self.storage_type == self.STORAGE_TYPE_GPG)
+        return self._thumbnail_file
 
 
 class SavedView(ModelWithOwner):

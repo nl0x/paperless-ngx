@@ -1,7 +1,6 @@
 import datetime
 import hashlib
 import logging
-import shutil
 import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,7 +15,6 @@ from django.db import models
 from django.db import transaction
 from django.db.models.signals import post_save
 from django.utils import timezone
-from filelock import FileLock
 from whoosh.writing import AsyncWriter
 
 from documents import index
@@ -31,8 +29,6 @@ from documents.consumer import WorkflowTriggerPlugin
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
 from documents.double_sided import CollatePlugin
-from documents.file_handling import create_source_path_directory
-from documents.file_handling import generate_unique_filename
 from documents.matching import prefilter_documents_by_workflowtrigger
 from documents.models import Correspondent
 from documents.models import CustomFieldInstance
@@ -265,74 +261,77 @@ def update_document_content_maybe_archive_file(document_id):
     parser: DocumentParser = parser_class(logging_group=uuid.uuid4())
 
     try:
-        parser.parse(document.source_path, mime_type, document.get_public_filename())
+        # Materialize source document to temp for processing
+        with document.source_file.materialize() as local_source:
+            parser.parse(str(local_source), mime_type, document.get_public_filename())
 
-        thumbnail = parser.get_thumbnail(
-            document.source_path,
-            mime_type,
-            document.get_public_filename(),
-        )
+            thumbnail = parser.get_thumbnail(
+                str(local_source),
+                mime_type,
+                document.get_public_filename(),
+            )
 
-        with transaction.atomic():
-            oldDocument = Document.objects.get(pk=document.pk)
-            if parser.get_archive_path():
-                with Path(parser.get_archive_path()).open("rb") as f:
-                    checksum = hashlib.md5(f.read()).hexdigest()
-                # I'm going to save first so that in case the file move
-                # fails, the database is rolled back.
-                # We also don't use save() since that triggers the filehandling
-                # logic, and we don't want that yet (file not yet in place)
-                document.archive_filename = generate_unique_filename(
-                    document,
+        # Write files to storage BEFORE DB transaction
+        # If storage write fails, transaction never starts
+        # Write thumbnail first
+        with open(thumbnail, 'rb') as f:
+            document.thumbnail_file.write(f)
+
+        # Write archive if it exists
+        archive_path = parser.get_archive_path()
+        if archive_path:
+            # Generate archive filename once if not already set
+            if not document.archive_filename:
+                document.archive_filename = str(document.generate_unique_filename(
                     archive_filename=True,
-                )
+                ))
+            with open(archive_path, 'rb') as f:
+                document.archive_file.write(f)
+
+        # Now update DB in transaction
+        with transaction.atomic():
+            # Lock the document row to prevent concurrent updates
+            document = Document.objects.select_for_update().get(pk=document.pk)
+            oldDocument = document
+
+            if archive_path:
+                with Path(archive_path).open("rb") as f:
+                    checksum = hashlib.md5(f.read()).hexdigest()
+
+                # Use the same archive_filename that was already set
                 Document.objects.filter(pk=document.pk).update(
                     archive_checksum=checksum,
                     content=parser.get_text(),
                     archive_filename=document.archive_filename,
                 )
-                newDocument = Document.objects.get(pk=document.pk)
                 if settings.AUDIT_LOG_ENABLED:
+                    newDocument = Document.objects.get(pk=document.pk)
                     LogEntry.objects.log_create(
                         instance=oldDocument,
                         changes={
-                            "content": [oldDocument.content, newDocument.content],
-                            "archive_checksum": [
-                                oldDocument.archive_checksum,
-                                newDocument.archive_checksum,
-                            ],
-                            "archive_filename": [
-                                oldDocument.archive_filename,
-                                newDocument.archive_filename,
-                            ],
+                            "content": [oldDocument.content, parser.get_text()],
+                            "archive_checksum": [oldDocument.archive_checksum, checksum],
+                            "archive_filename": [oldDocument.archive_filename, document.archive_filename],
                         },
-                        additional_data={
-                            "reason": "Update document content",
-                        },
+                        additional_data={"reason": "Update document content"},
                         action=LogEntry.Action.UPDATE,
                     )
             else:
                 Document.objects.filter(pk=document.pk).update(
                     content=parser.get_text(),
                 )
-
                 if settings.AUDIT_LOG_ENABLED:
                     LogEntry.objects.log_create(
                         instance=oldDocument,
-                        changes={
-                            "content": [oldDocument.content, parser.get_text()],
-                        },
-                        additional_data={
-                            "reason": "Update document content",
-                        },
+                        changes={"content": [oldDocument.content, parser.get_text()]},
+                        additional_data={"reason": "Update document content"},
                         action=LogEntry.Action.UPDATE,
                     )
 
-            with FileLock(settings.MEDIA_LOCK):
-                if parser.get_archive_path():
-                    create_source_path_directory(document.archive_path)
-                    shutil.move(parser.get_archive_path(), document.archive_path)
-                shutil.move(thumbnail, document.thumbnail_path)
+        # Clean up local temp files after successful storage
+        if archive_path:
+            Path(archive_path).unlink(missing_ok=True)
+        Path(thumbnail).unlink(missing_ok=True)
 
         document.refresh_from_db()
         logger.info(

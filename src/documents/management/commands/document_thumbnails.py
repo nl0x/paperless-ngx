@@ -1,6 +1,7 @@
 import logging
 import multiprocessing
 import shutil
+from pathlib import Path
 
 import tqdm
 from django import db
@@ -23,13 +24,20 @@ def _process_document(doc_id):
         return
 
     try:
-        thumb = parser.get_thumbnail(
-            document.source_path,
-            document.mime_type,
-            document.get_public_filename(),
-        )
-
-        shutil.move(thumb, document.thumbnail_path)
+        # Materialize source document to local file for parser
+        with document.source_file.materialize() as source_path:
+            thumb = parser.get_thumbnail(
+                source_path,
+                document.mime_type,
+                document.get_public_filename(),
+            )
+        
+        # Write thumbnail to storage
+        with open(thumb, 'rb') as f:
+            document.thumbnail_file.write(f)
+        
+        # Clean up temp thumbnail file
+        Path(thumb).unlink(missing_ok=True)
     finally:
         parser.cleanup()
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-import shutil
 import socket
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -29,11 +28,9 @@ from django.utils import timezone
 from filelock import FileLock
 from guardian.shortcuts import remove_perm
 
+from documents import index
 from documents import matching
 from documents.caching import clear_document_caches
-from documents.file_handling import create_source_path_directory
-from documents.file_handling import delete_empty_directories
-from documents.file_handling import generate_unique_filename
 from documents.mail import send_email
 from documents.models import Correspondent
 from documents.models import CustomField
@@ -327,68 +324,68 @@ def set_storage_path(
 def cleanup_document_deletion(sender, instance, **kwargs):
     with FileLock(settings.MEDIA_LOCK):
         if settings.EMPTY_TRASH_DIR:
-            # Find a non-conflicting filename in case a document with the same
-            # name was moved to trash earlier
-            counter = 0
-            old_filename = Path(instance.source_path).name
-            old_filebase = Path(old_filename).stem
-            old_fileext = Path(old_filename).suffix
-
-            while True:
-                new_file_path = settings.EMPTY_TRASH_DIR / (
-                    old_filebase + (f"_{counter:02}" if counter else "") + old_fileext
-                )
-
-                if new_file_path.exists():
-                    counter += 1
-                else:
-                    break
-
-            logger.debug(f"Moving {instance.source_path} to trash at {new_file_path}")
+            # Move source file to trash
+            trash_filename = instance.get_public_filename()
             try:
-                shutil.move(instance.source_path, new_file_path)
-            except OSError as e:
+                instance.source_file.move_to_trash(trash_filename)
+                logger.debug(f"Moved document {instance!s} to trash")
+            except Exception as e:
                 logger.error(
-                    f"Failed to move {instance.source_path} to trash at "
-                    f"{new_file_path}: {e}. Skipping cleanup!",
+                    f"Failed to move document {instance!s} to trash: {e}. "
+                    "Skipping cleanup!",
                 )
                 return
-
-        files = (
-            instance.archive_path,
-            instance.thumbnail_path,
-        )
-        if not settings.EMPTY_TRASH_DIR:
-            # Only delete the original file if we are not moving it to trash dir
-            files += (instance.source_path,)
-
-        for filename in files:
-            if filename and filename.is_file():
+            
+            # Delete archive and thumbnail (not moved to trash)
+            if instance.has_archive_version:
                 try:
-                    filename.unlink()
-                    logger.debug(f"Deleted file {filename}.")
-                except OSError as e:
+                    instance.archive_file.delete()
+                    logger.debug("Deleted archive file")
+                except Exception as e:
                     logger.warning(
-                        f"While deleting document {instance!s}, the file "
-                        f"{filename} could not be deleted: {e}",
+                        f"While deleting document {instance!s}, the archive file "
+                        f"could not be deleted: {e}",
                     )
-            elif filename and not filename.is_file():
-                logger.warning(f"Expected {filename} to exist, but it did not")
+            
+            try:
+                instance.thumbnail_file.delete()
+                logger.debug("Deleted thumbnail file")
+            except Exception as e:
+                logger.warning(
+                    f"While deleting document {instance!s}, the thumbnail file "
+                    f"could not be deleted: {e}",
+                )
+        else:
+            # No trash directory configured, delete all files
+            try:
+                instance.source_file.delete()
+                logger.debug("Deleted source file")
+            except Exception as e:
+                logger.warning(
+                    f"While deleting document {instance!s}, the source file "
+                    f"could not be deleted: {e}",
+                )
+            
+            if instance.has_archive_version:
+                try:
+                    instance.archive_file.delete()
+                    logger.debug("Deleted archive file")
+                except Exception as e:
+                    logger.warning(
+                        f"While deleting document {instance!s}, the archive file "
+                        f"could not be deleted: {e}",
+                    )
+            
+            try:
+                instance.thumbnail_file.delete()
+                logger.debug("Deleted thumbnail file")
+            except Exception as e:
+                logger.warning(
+                    f"While deleting document {instance!s}, the thumbnail file "
+                    f"could not be deleted: {e}",
+                )
 
-        delete_empty_directories(
-            Path(instance.source_path).parent,
-            root=settings.ORIGINALS_DIR,
-        )
 
-        if instance.has_archive_version:
-            delete_empty_directories(
-                Path(instance.archive_path).parent,
-                root=settings.ARCHIVE_DIR,
-            )
-
-
-class CannotMoveFilesException(Exception):
-    pass
 
 
 # should be disabled in /src/documents/management/commands/document_importer.py handle
@@ -402,19 +399,6 @@ def update_filename_and_move_files(
 ):
     if isinstance(instance, CustomFieldInstance):
         instance = instance.document
-
-    def validate_move(instance, old_path: Path, new_path: Path):
-        if not old_path.is_file():
-            # Can't do anything if the old file does not exist anymore.
-            msg = f"Document {instance!s}: File {old_path} doesn't exist."
-            logger.fatal(msg)
-            raise CannotMoveFilesException(msg)
-
-        if new_path.is_file():
-            # Can't do anything if the new file already exists. Skip updating file.
-            msg = f"Document {instance!s}: Cannot rename file since target path {new_path} already exists."
-            logger.warning(msg)
-            raise CannotMoveFilesException(msg)
 
     if not instance.filename:
         # Can't update the filename if there is no filename to begin with
@@ -435,100 +419,31 @@ def update_filename_and_move_files(
             # So freshen up the data before doing anything
             instance.refresh_from_db()
 
-            old_filename = instance.filename
-            old_source_path = instance.source_path
-
-            # Need to convert to string to be able to save it to the db
-            instance.filename = str(generate_unique_filename(instance))
-            move_original = old_filename != instance.filename
-
-            old_archive_filename = instance.archive_filename
-            old_archive_path = instance.archive_path
-
-            if instance.has_archive_version:
-                # Need to convert to string to be able to save it to the db
-                instance.archive_filename = str(
-                    generate_unique_filename(
-                        instance,
-                        archive_filename=True,
-                    ),
+            # Use the new rename_files method which handles all the complexity
+            files_renamed, old_filename, old_archive_filename = instance.rename_files()
+            
+            if files_renamed:
+                # Don't save() here to prevent infinite recursion.
+                Document.global_objects.filter(pk=instance.pk).update(
+                    filename=instance.filename,
+                    archive_filename=instance.archive_filename,
+                    modified=timezone.now(),
                 )
-
-                move_archive = old_archive_filename != instance.archive_filename
+                # Clear any caching for this document.  Slightly overkill, but not terrible
+                clear_document_caches(instance.pk)
+                logger.debug(f"Renamed files for document {instance.pk}")
             else:
-                move_archive = False
-
-            if not move_original and not move_archive:
-                # Just update modified. Also, don't save() here to prevent infinite recursion.
+                # No files were renamed, just update modified
                 Document.objects.filter(pk=instance.pk).update(
                     modified=timezone.now(),
                 )
-                return
 
-            if move_original:
-                validate_move(instance, old_source_path, instance.source_path)
-                create_source_path_directory(instance.source_path)
-                shutil.move(old_source_path, instance.source_path)
+        except (OSError, DatabaseError, FileExistsError) as e:
+            logger.warning(f"Exception during file renaming: {e}")
+            # The rename_files method already handles rollback internally,
+            # so the instance should already be restored to its original state
 
-            if move_archive:
-                validate_move(instance, old_archive_path, instance.archive_path)
-                create_source_path_directory(instance.archive_path)
-                shutil.move(old_archive_path, instance.archive_path)
-
-            # Don't save() here to prevent infinite recursion.
-            Document.global_objects.filter(pk=instance.pk).update(
-                filename=instance.filename,
-                archive_filename=instance.archive_filename,
-                modified=timezone.now(),
-            )
-            # Clear any caching for this document.  Slightly overkill, but not terrible
-            clear_document_caches(instance.pk)
-
-        except (OSError, DatabaseError, CannotMoveFilesException) as e:
-            logger.warning(f"Exception during file handling: {e}")
-            # This happens when either:
-            #  - moving the files failed due to file system errors
-            #  - saving to the database failed due to database errors
-            # In both cases, we need to revert to the original state.
-
-            # Try to move files to their original location.
-            try:
-                if move_original and instance.source_path.is_file():
-                    logger.info("Restoring previous original path")
-                    shutil.move(instance.source_path, old_source_path)
-
-                if move_archive and instance.archive_path.is_file():
-                    logger.info("Restoring previous archive path")
-                    shutil.move(instance.archive_path, old_archive_path)
-
-            except Exception:
-                # This is fine, since:
-                # A: if we managed to move source from A to B, we will also
-                #  manage to move it from B to A. If not, we have a serious
-                #  issue that's going to get caught by the santiy checker.
-                #  All files remain in place and will never be overwritten,
-                #  so this is not the end of the world.
-                # B: if moving the original file failed, nothing has changed
-                #  anyway.
-                pass
-
-            # restore old values on the instance
-            instance.filename = old_filename
-            instance.archive_filename = old_archive_filename
-
-        # finally, remove any empty sub folders. This will do nothing if
-        # something has failed above.
-        if not old_source_path.is_file():
-            delete_empty_directories(
-                Path(old_source_path).parent,
-                root=settings.ORIGINALS_DIR,
-            )
-
-        if instance.has_archive_version and not old_archive_path.is_file():
-            delete_empty_directories(
-                Path(old_archive_path).parent,
-                root=settings.ARCHIVE_DIR,
-            )
+        # Directory cleanup is handled automatically by the storage backend's rename method
 
 
 # should be disabled in /src/documents/management/commands/document_importer.py handle
@@ -634,8 +549,6 @@ def cleanup_user_deletion(sender, instance: User | Group, **kwargs):
 
 
 def add_to_index(sender, document, **kwargs):
-    from documents import index
-
     index.add_or_update_document(document)
 
 
@@ -1260,14 +1173,28 @@ def run_workflows(
                     )
             files = None
             if action.webhook.include_document:
-                with original_file.open("rb") as f:
-                    files = {
-                        "file": (
-                            filename,
-                            f.read(),
-                            document.mime_type,
-                        ),
-                    }
+                from documents.data_models import ConsumableDocument
+                
+                if isinstance(document, ConsumableDocument):
+                    # ConsumableDocument - original_file is a Path object
+                    with original_file.open("rb") as f:
+                        files = {
+                            "file": (
+                                filename,
+                                f.read(),
+                                document.mime_type,
+                            ),
+                        }
+                else:
+                    # Document - original_file is a DocumentFile with open method
+                    with original_file.open("rb") as f:
+                        files = {
+                            "file": (
+                                filename,
+                                f.read(),
+                                document.mime_type,
+                            ),
+                        }
             send_webhook.delay(
                 url=action.webhook.url,
                 data=data,
@@ -1287,9 +1214,12 @@ def run_workflows(
 
     use_overrides = overrides is not None
     if original_file is None:
-        original_file = (
-            document.source_path if not use_overrides else document.original_file
-        )
+        if not use_overrides:
+            # For saved Document, use the source_file abstraction
+            original_file = document.source_file
+        else:
+            # For ConsumableDocument during consumption, use the original_file Path
+            original_file = document.original_file
     messages = []
 
     workflows = (

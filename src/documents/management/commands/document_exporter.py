@@ -32,8 +32,6 @@ if TYPE_CHECKING:
 if settings.AUDIT_LOG_ENABLED:
     from auditlog.models import LogEntry
 
-from documents.file_handling import delete_empty_directories
-from documents.file_handling import generate_filename
 from documents.management.commands.mixins import CryptMixin
 from documents.models import Correspondent
 from documents.models import CustomField
@@ -400,11 +398,19 @@ class Command(CryptMixin, BaseCommand):
             if not self.zip_export:
                 for f in self.files_in_export_dir:
                     f.unlink()
-
-                    delete_empty_directories(
-                        f.parent,
-                        self.target,
-                    )
+                    
+                    # Try to remove empty parent directories
+                    try:
+                        parent = f.parent
+                        while parent != self.target and parent.is_relative_to(self.target):
+                            if not any(parent.iterdir()):  # Check if empty
+                                parent.rmdir()
+                                parent = parent.parent
+                            else:
+                                break
+                    except OSError:
+                        # Ignore errors when removing directories
+                        pass
             else:
                 # 5. Remove anything in the original location (before moving the zip)
                 for item in self.original_target.glob("*"):
@@ -420,8 +426,7 @@ class Command(CryptMixin, BaseCommand):
         filename_counter = 0
         while True:
             if self.use_filename_format:
-                base_name = generate_filename(
-                    document,
+                base_name = document.generate_filename(
                     counter=filename_counter,
                     append_gpg=False,
                 )
@@ -482,42 +487,22 @@ class Command(CryptMixin, BaseCommand):
 
         If the document is encrypted, the files are decrypted before copying them to the target location.
         """
-        if document.storage_type == Document.STORAGE_TYPE_GPG:
-            t = int(time.mktime(document.created.timetuple()))
-
-            original_target.parent.mkdir(parents=True, exist_ok=True)
-            with document.source_file as out_file:
-                original_target.write_bytes(GnuPG.decrypted(out_file))
-                os.utime(original_target, times=(t, t))
-
-            if thumbnail_target:
-                thumbnail_target.parent.mkdir(parents=True, exist_ok=True)
-                with document.thumbnail_file as out_file:
-                    thumbnail_target.write_bytes(GnuPG.decrypted(out_file))
-                    os.utime(thumbnail_target, times=(t, t))
-
-            if archive_target:
-                archive_target.parent.mkdir(parents=True, exist_ok=True)
-                if TYPE_CHECKING:
-                    assert isinstance(document.archive_path, Path)
-                with document.archive_path as out_file:
-                    archive_target.write_bytes(GnuPG.decrypted(out_file))
-                    os.utime(archive_target, times=(t, t))
-        else:
-            self.check_and_copy(
-                document.source_path,
+        # File abstraction handles GPG decryption transparently via materialize()
+        with document.source_file.materialize() as source_file:
+            self.check_and_copy_from_storage(
+                Path(source_file),
                 document.checksum,
                 original_target,
             )
 
-            if thumbnail_target:
-                self.check_and_copy(document.thumbnail_path, None, thumbnail_target)
+        if thumbnail_target:
+            with document.thumbnail_file.materialize() as thumb_file:
+                self.check_and_copy_from_storage(Path(thumb_file), None, thumbnail_target)
 
-            if archive_target:
-                if TYPE_CHECKING:
-                    assert isinstance(document.archive_path, Path)
-                self.check_and_copy(
-                    document.archive_path,
+        if archive_target and document.archive_file:
+            with document.archive_file.materialize() as archive_file:
+                self.check_and_copy_from_storage(
+                    Path(archive_file),
                     document.archive_checksum,
                     archive_target,
                 )
@@ -586,6 +571,41 @@ class Command(CryptMixin, BaseCommand):
         if perform_copy:
             target.parent.mkdir(parents=True, exist_ok=True)
             copy_file_with_basic_stats(source, target)
+
+    def check_and_copy_from_storage(
+        self,
+        source: Path,
+        source_checksum: str | None,
+        target: Path,
+    ):
+        """
+        Copies the source from storage to the target.
+        For storage backends, we can't rely on mtime comparison, so we use checksums when available.
+        """
+
+        target = target.resolve()
+        if target in self.files_in_export_dir:
+            self.files_in_export_dir.remove(target)
+
+        perform_copy = False
+
+        if target.exists():
+            if self.compare_checksums and source_checksum:
+                target_checksum = hashlib.md5(target.read_bytes()).hexdigest()
+                perform_copy = target_checksum != source_checksum
+            else:
+                # For storage backends, always copy if no checksum available
+                # since we can't reliably compare mtime
+                perform_copy = True
+        else:
+            # Copy if it does not exist
+            perform_copy = True
+
+        if perform_copy:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Simple copy since source is already materialized
+            import shutil
+            shutil.copy2(source, target)
 
     def encrypt_secret_fields(self, manifest: dict) -> None:
         """

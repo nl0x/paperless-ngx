@@ -18,8 +18,6 @@ from rest_framework.reverse import reverse
 from documents.classifier import load_classifier
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
-from documents.file_handling import create_source_path_directory
-from documents.file_handling import generate_unique_filename
 from documents.loggers import LoggingMixin
 from documents.models import Correspondent
 from documents.models import CustomField
@@ -220,6 +218,43 @@ class ConsumerPlugin(
             f"Executing post-consume script {settings.POST_CONSUME_SCRIPT}",
         )
 
+        # Materialize source document
+        with document.source_file.materialize() as source_temp_path:
+            # Materialize thumbnail
+            with document.thumbnail_file.materialize() as thumbnail_temp_path:
+                # Materialize archive if it exists
+                archive_temp_path = None
+                archive_context = None
+                try:
+                    if document.archive_file:
+                        archive_context = document.archive_file.materialize()
+                        archive_temp_path = archive_context.__enter__()
+                    
+                    # Now run the script with materialized paths
+                    self._execute_post_consume_script(
+                        document,
+                        str(source_temp_path),
+                        str(archive_temp_path) if archive_temp_path else "",
+                        str(thumbnail_temp_path),
+                    )
+                finally:
+                    # Clean up archive context if it was created
+                    if archive_context is not None:
+                        archive_context.__exit__(None, None, None)
+
+    def _execute_post_consume_script(
+        self,
+        document: Document,
+        source_path: str,
+        archive_path: str,
+        thumbnail_path: str,
+    ):
+        """
+        Execute the post-consume script with the given file paths.
+        
+        This is separated out to handle both S3 (with materialized paths)
+        and local storage (with direct paths).
+        """
         script_env = os.environ.copy()
 
         script_env["DOCUMENT_ID"] = str(document.pk)
@@ -228,13 +263,9 @@ class ConsumerPlugin(
         script_env["DOCUMENT_MODIFIED"] = str(document.modified)
         script_env["DOCUMENT_ADDED"] = str(document.added)
         script_env["DOCUMENT_FILE_NAME"] = document.get_public_filename()
-        script_env["DOCUMENT_SOURCE_PATH"] = os.path.normpath(document.source_path)
-        script_env["DOCUMENT_ARCHIVE_PATH"] = os.path.normpath(
-            str(document.archive_path),
-        )
-        script_env["DOCUMENT_THUMBNAIL_PATH"] = os.path.normpath(
-            document.thumbnail_path,
-        )
+        script_env["DOCUMENT_SOURCE_PATH"] = source_path
+        script_env["DOCUMENT_ARCHIVE_PATH"] = archive_path
+        script_env["DOCUMENT_THUMBNAIL_PATH"] = thumbnail_path
         script_env["DOCUMENT_DOWNLOAD_URL"] = reverse(
             "document-download",
             kwargs={"pk": document.pk},
@@ -259,8 +290,8 @@ class ConsumerPlugin(
                     settings.POST_CONSUME_SCRIPT,
                     str(document.pk),
                     document.get_public_filename(),
-                    os.path.normpath(document.source_path),
-                    os.path.normpath(document.thumbnail_path),
+                    source_path,
+                    thumbnail_path,
                     reverse("document-download", kwargs={"pk": document.pk}),
                     reverse("document-thumb", kwargs={"pk": document.pk}),
                     str(document.correspondent),
@@ -493,34 +524,34 @@ class ConsumerPlugin(
                 # After everything is in the database, copy the files into
                 # place. If this fails, we'll also rollback the transaction.
                 with FileLock(settings.MEDIA_LOCK):
-                    document.filename = generate_unique_filename(document)
-                    create_source_path_directory(document.source_path)
-
-                    self._write(
-                        document.storage_type,
+                    # Write source document to storage
+                    source_file = (
                         self.unmodified_original
                         if self.unmodified_original is not None
-                        else self.working_copy,
-                        document.source_path,
+                        else self.working_copy
                     )
+                    
+                    # Generate filename if not set
+                    if not document.filename:
+                        document.filename = str(document.generate_unique_filename())
+                    
+                    # Write source file
+                    with open(source_file, "rb") as f:
+                        document.source_file.write(f)
 
-                    self._write(
-                        document.storage_type,
-                        thumbnail,
-                        document.thumbnail_path,
-                    )
+                    # Write thumbnail to storage
+                    if thumbnail and Path(thumbnail).exists():
+                        with open(thumbnail, "rb") as f:
+                            document.thumbnail_file.write(f)
 
+                    # Write archive if it exists
                     if archive_path and Path(archive_path).is_file():
-                        document.archive_filename = generate_unique_filename(
-                            document,
-                            archive_filename=True,
-                        )
-                        create_source_path_directory(document.archive_path)
-                        self._write(
-                            document.storage_type,
-                            archive_path,
-                            document.archive_path,
-                        )
+                        # Generate archive filename if not set
+                        if not document.archive_filename:
+                            document.archive_filename = str(document.generate_unique_filename(archive_filename=True))
+                        
+                        with open(archive_path, "rb") as f:
+                            document.archive_file.write(f)
 
                         with Path(archive_path).open("rb") as f:
                             document.archive_checksum = hashlib.md5(
@@ -736,18 +767,6 @@ class ConsumerPlugin(
                 }
                 CustomFieldInstance.objects.create(**args)  # adds to document
 
-    def _write(self, storage_type, source, target):
-        with (
-            Path(source).open("rb") as read_file,
-            Path(target).open("wb") as write_file,
-        ):
-            write_file.write(read_file.read())
-
-        # Attempt to copy file's original stats, but it's ok if we can't
-        try:
-            copy_basic_file_stats(source, target)
-        except Exception:  # pragma: no cover
-            pass
 
 
 class ConsumerPreflightPlugin(

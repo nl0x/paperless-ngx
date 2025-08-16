@@ -276,6 +276,8 @@ DATA_DIR = __get_path("PAPERLESS_DATA_DIR", BASE_DIR.parent / "data")
 NLTK_DIR = __get_path("PAPERLESS_NLTK_DIR", "/usr/share/nltk_data")
 
 # Check deprecated setting first
+# For local filesystem storage: Path where deleted files are moved when trash is emptied
+# For S3 storage: Used as a key prefix (e.g., "trash" → "trash/filename.pdf" in S3)
 EMPTY_TRASH_DIR = (
     __get_path("PAPERLESS_TRASH_DIR", os.getenv("PAPERLESS_EMPTY_TRASH_DIR"))
     if os.getenv("PAPERLESS_TRASH_DIR") or os.getenv("PAPERLESS_EMPTY_TRASH_DIR")
@@ -1020,6 +1022,24 @@ CONSUMER_INOTIFY_DELAY: Final[float] = __get_float(
 CONSUMER_DELETE_DUPLICATES = __get_boolean("PAPERLESS_CONSUMER_DELETE_DUPLICATES")
 
 CONSUMER_RECURSIVE = __get_boolean("PAPERLESS_CONSUMER_RECURSIVE")
+
+###############################################################################
+# Storage Backend Configuration                                               #
+###############################################################################
+
+# Storage backend: 'local' (default) or 's3'
+PAPERLESS_STORAGE_BACKEND = os.getenv("PAPERLESS_STORAGE_BACKEND", "local").lower()
+
+# S3 configuration (when PAPERLESS_STORAGE_BACKEND=s3)
+S3_BUCKET = os.getenv("PAPERLESS_S3_BUCKET")  # Required for S3 backend
+S3_REGION = os.getenv("PAPERLESS_S3_REGION", "us-east-1")
+S3_ENDPOINT = os.getenv("PAPERLESS_S3_ENDPOINT")  # For MinIO/alternatives
+S3_ACCESS_KEY = os.getenv("PAPERLESS_S3_ACCESS_KEY")  # Optional
+S3_SECRET_KEY = os.getenv("PAPERLESS_S3_SECRET_KEY")  # Optional
+# If credentials are not provided, will fall back to:
+# - Standard AWS env vars (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+# - IAM instance role (automatic on EC2/ECS/Lambda)
+# - AWS credentials file (~/.aws/credentials)
 
 # Ignore glob patterns, relative to PAPERLESS_CONSUMPTION_DIR
 CONSUMER_IGNORE_PATTERNS = list(

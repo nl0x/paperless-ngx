@@ -59,35 +59,41 @@ class Command(BaseCommand):
         for document in encrypted_files:
             self.stdout.write(f"Decrypting {document}")
 
-            old_paths = [document.source_path, document.thumbnail_path]
-
-            with document.source_file as file_handle:
+            # Read encrypted files and decrypt them
+            with document.source_file.open() as file_handle:
                 raw_document = GnuPG.decrypted(file_handle, passphrase)
-            with document.thumbnail_file as file_handle:
+            with document.thumbnail_file.open() as file_handle:
                 raw_thumb = GnuPG.decrypted(file_handle, passphrase)
 
-            document.storage_type = Document.STORAGE_TYPE_UNENCRYPTED
-
+            # Verify filename ends with .gpg
             ext: str = Path(document.filename).suffix
-
             if not ext == ".gpg":
                 raise CommandError(
-                    f"Abort: encrypted file {document.source_path} does not "
+                    f"Abort: encrypted file {document.filename} does not "
                     f"end with .gpg",
                 )
 
+            # Store old keys for deletion
+            old_source_key = document.storage_key_source()
+            old_thumb_key = document.storage_key_thumbnail()
+
+            # Update document to unencrypted
+            document.storage_type = Document.STORAGE_TYPE_UNENCRYPTED
             document.filename = Path(document.filename).stem
 
-            with document.source_path.open("wb") as f:
-                f.write(raw_document)
+            # Write decrypted content to new location
+            document.source_file.write(raw_document)
+            document.thumbnail_file.write(raw_thumb)
 
-            with document.thumbnail_path.open("wb") as f:
-                f.write(raw_thumb)
-
+            # Update database
             Document.objects.filter(id=document.id).update(
                 storage_type=document.storage_type,
                 filename=document.filename,
             )
 
-            for path in old_paths:
-                path.unlink()
+            # Delete old encrypted files
+            from documents.storage.file_abstraction import DocumentFile
+            if old_source_key:
+                DocumentFile(old_source_key).delete()
+            if old_thumb_key:
+                DocumentFile(old_thumb_key).delete()

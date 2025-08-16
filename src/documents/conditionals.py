@@ -129,7 +129,7 @@ def thumbnail_last_modified(request, pk: int) -> datetime | None:
     """
     try:
         doc = Document.objects.only("storage_type").get(pk=pk)
-        if not doc.thumbnail_path.exists():
+        if not doc.thumbnail_file.exists:
             return None
         doc_key = get_thumbnail_modified_key(pk)
 
@@ -139,10 +139,8 @@ def thumbnail_last_modified(request, pk: int) -> datetime | None:
             return cache_hit
 
         # No cache, get the timestamp and cache the datetime
-        last_modified = datetime.fromtimestamp(
-            doc.thumbnail_path.stat().st_mtime,
-            tz=timezone.utc,
-        )
+        last_modified = doc.thumbnail_file.modified_time
+ 
         cache.set(doc_key, last_modified, CACHE_50_MINUTES)
         return last_modified
     except Document.DoesNotExist:  # pragma: no cover

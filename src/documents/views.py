@@ -665,8 +665,15 @@ class DocumentViewSet(
             disposition=disposition,
         )
 
-    def get_metadata(self, file, mime_type):
-        if not Path(file).is_file():
+    def get_metadata(self, document_file, mime_type):
+        """
+        Extract metadata from a document file.
+        
+        Args:
+            document_file: DocumentFile instance
+            mime_type: MIME type of the document
+        """
+        if not document_file.exists:
             return None
 
         parser_class = get_parser_class_for_mime_type(mime_type)
@@ -674,20 +681,16 @@ class DocumentViewSet(
             parser = parser_class(progress_callback=None, logging_group=None)
 
             try:
-                return parser.extract_metadata(file, mime_type)
+                # Materialize file for parser to read
+                with document_file.materialize() as file_path:
+                    return parser.extract_metadata(file_path, mime_type)
             except Exception:  # pragma: no cover
-                logger.exception(f"Issue getting metadata for {file}")
+                logger.exception(f"Issue getting metadata for document (key: {document_file.key})")
                 # TODO: cover GPG errors, remove later.
                 return []
         else:  # pragma: no cover
             logger.warning(f"No parser for {mime_type}")
             return []
-
-    def get_filesize(self, filename):
-        if Path(filename).is_file():
-            return Path(filename).stat().st_size
-        else:
-            return None
 
     @action(methods=["get"], detail=True, filter_backends=[])
     @method_decorator(cache_control(no_cache=True))
@@ -710,25 +713,25 @@ class DocumentViewSet(
 
         archive_metadata = None
         archive_filesize = (
-            self.get_filesize(doc.archive_path) if doc.has_archive_version else None
+            doc.archive_file.size if doc.has_archive_version else None
         )
         if document_cached_metadata is not None:
             original_metadata = document_cached_metadata.original_metadata
             archive_metadata = document_cached_metadata.archive_metadata
             refresh_metadata_cache(doc.pk)
         else:
-            original_metadata = self.get_metadata(doc.source_path, doc.mime_type)
+            original_metadata = self.get_metadata(doc.source_file, doc.mime_type)
 
             if doc.has_archive_version:
                 archive_metadata = self.get_metadata(
-                    doc.archive_path,
+                    doc.archive_file,
                     "application/pdf",
                 )
             set_metadata_cache(doc, original_metadata, archive_metadata)
 
         meta = {
             "original_checksum": doc.checksum,
-            "original_size": self.get_filesize(doc.source_path),
+            "original_size": doc.source_file.size,
             "original_mime_type": doc.mime_type,
             "media_filename": doc.filename,
             "has_archive_version": doc.has_archive_version,
@@ -824,10 +827,8 @@ class DocumentViewSet(
                 doc,
             ):
                 return HttpResponseForbidden("Insufficient permissions")
-            if doc.storage_type == Document.STORAGE_TYPE_GPG:
-                handle = GnuPG.decrypted(doc.thumbnail_file)
-            else:
-                handle = doc.thumbnail_file
+            
+            handle = doc.thumbnail_file.open()
 
             return HttpResponse(handle, content_type="image/webp")
         except (FileNotFoundError, Document.DoesNotExist):
@@ -1074,17 +1075,22 @@ class DocumentViewSet(
             ):
                 return HttpResponseBadRequest("Invalid email address found")
 
-            send_email(
-                subject=request.data.get("subject"),
-                body=request.data.get("message"),
-                to=addresses,
-                attachment=(
-                    doc.archive_path
-                    if use_archive_version and doc.has_archive_version
-                    else doc.source_path
-                ),
-                attachment_mime_type=doc.mime_type,
+            # Determine which file to send
+            document_file = (
+                doc.archive_file
+                if use_archive_version and doc.has_archive_version
+                else doc.source_file
             )
+            
+            # Materialize file for email attachment
+            with document_file.materialize() as attachment_path:
+                send_email(
+                    subject=request.data.get("subject"),
+                    body=request.data.get("message"),
+                    to=addresses,
+                    attachment=Path(attachment_path),
+                    attachment_mime_type=doc.mime_type,
+                )
             logger.debug(
                 f"Sent document {doc.id} via email to {addresses}",
             )
@@ -2448,19 +2454,16 @@ class SharedLinkView(View):
 
 def serve_file(*, doc: Document, use_archive: bool, disposition: str):
     if use_archive:
-        file_handle = doc.archive_file
+        file_handle = doc.archive_file.open()
         filename = doc.get_public_filename(archive=True)
         mime_type = "application/pdf"
     else:
-        file_handle = doc.source_file
+        file_handle = doc.source_file.open()
         filename = doc.get_public_filename()
         mime_type = doc.mime_type
         # Support browser previewing csv files by using text mime type
         if mime_type in {"application/csv", "text/csv"} and disposition == "inline":
             mime_type = "text/plain"
-
-    if doc.storage_type == Document.STORAGE_TYPE_GPG:
-        file_handle = GnuPG.decrypted(file_handle)
 
     response = HttpResponse(file_handle, content_type=mime_type)
     # Firefox is not able to handle unicode characters in filename field

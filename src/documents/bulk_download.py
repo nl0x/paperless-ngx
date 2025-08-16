@@ -75,33 +75,35 @@ class BulkArchiveStrategy:
 
 class OriginalsOnlyStrategy(BulkArchiveStrategy):
     def add_document(self, doc: Document) -> None:
-        self.zipf.write(doc.source_path, self.make_unique_filename(doc))
+        with doc.source_file.materialize() as source_file:
+            self.zipf.write(source_file, self.make_unique_filename(doc))
 
 
 class ArchiveOnlyStrategy(BulkArchiveStrategy):
     def add_document(self, doc: Document) -> None:
-        if doc.has_archive_version:
-            if TYPE_CHECKING:
-                assert doc.archive_path is not None
-            self.zipf.write(
-                doc.archive_path,
-                self.make_unique_filename(doc, archive=True),
-            )
+        if doc.archive_file:
+            with doc.archive_file.materialize() as archive_file:
+                self.zipf.write(
+                    archive_file,
+                    self.make_unique_filename(doc, archive=True),
+                )
         else:
-            self.zipf.write(doc.source_path, self.make_unique_filename(doc))
+            # Use original if no archive exists
+            with doc.source_file.materialize() as source_file:
+                self.zipf.write(source_file, self.make_unique_filename(doc))
 
 
 class OriginalAndArchiveStrategy(BulkArchiveStrategy):
     def add_document(self, doc: Document) -> None:
-        if doc.has_archive_version:
-            if TYPE_CHECKING:
-                assert doc.archive_path is not None
-            self.zipf.write(
-                doc.archive_path,
-                self.make_unique_filename(doc, archive=True, folder="archive/"),
-            )
+        if doc.archive_file:
+            with doc.archive_file.materialize() as archive_file:
+                self.zipf.write(
+                    archive_file,
+                    self.make_unique_filename(doc, archive=True, folder="archive/"),
+                )
 
-        self.zipf.write(
-            doc.source_path,
-            self.make_unique_filename(doc, folder="originals/"),
-        )
+        with doc.source_file.materialize() as source_file:
+            self.zipf.write(
+                source_file,
+                self.make_unique_filename(doc, folder="originals/"),
+            )

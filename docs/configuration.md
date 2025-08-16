@@ -290,11 +290,14 @@ database, classification model, etc).
 : When documents are deleted (e.g. after emptying the trash) the original files will be moved here
 instead of being removed from the filesystem. Only the original version is kept.
 
+    For local filesystem storage: This is the directory path where files are moved.
+    For S3 storage: This is used as a key prefix (e.g., "trash" results in "trash/filename.pdf" in S3).
+
     This must be writeable by the user running paperless. When running
     inside docker, ensure that this path is within a permanent volume
     (such as "../media/trash") so it won't get lost on upgrades.
 
-    Note that the directory must exist prior to using this setting.
+    Note that for local filesystem storage, the directory must exist prior to using this setting.
 
     Defaults to empty (i.e. really delete files).
 
@@ -361,6 +364,81 @@ Defaults to `/usr/share/nltk_data`
 : This is where paperless will store the classification model.
 
     Defaults to `PAPERLESS_DATA_DIR/classification_model.pickle`.
+
+## Storage Backend
+
+Paperless supports multiple storage backends for storing documents, thumbnails, and archive files.
+
+#### [`PAPERLESS_STORAGE_BACKEND=<backend>`](#PAPERLESS_STORAGE_BACKEND) {#PAPERLESS_STORAGE_BACKEND}
+
+: Specifies which storage backend to use for document storage.
+
+    Available options:
+    - `local` - Local filesystem storage (default)
+    - `s3` - Amazon S3 or S3-compatible storage (MinIO, etc.)
+
+    Defaults to `local`.
+
+### S3 Storage Configuration
+
+These settings are only used when `PAPERLESS_STORAGE_BACKEND=s3`.
+
+#### [`PAPERLESS_S3_ENDPOINT=<url>`](#PAPERLESS_S3_ENDPOINT) {#PAPERLESS_S3_ENDPOINT}
+
+: The URL of the S3 endpoint. For AWS S3, this is typically not needed as the AWS SDK will use the default endpoint. For S3-compatible services like MinIO, set this to your service URL.
+
+    Example: `http://minio:9000` for MinIO
+
+    Defaults to empty (uses AWS default endpoints).
+
+#### [`PAPERLESS_S3_BUCKET=<name>`](#PAPERLESS_S3_BUCKET) {#PAPERLESS_S3_BUCKET}
+
+: The name of the S3 bucket where documents will be stored.
+
+    Required when using S3 storage backend.
+
+#### [`PAPERLESS_S3_REGION=<region>`](#PAPERLESS_S3_REGION) {#PAPERLESS_S3_REGION}
+
+: The AWS region for your S3 bucket.
+
+    Example: `us-east-1`
+
+    Defaults to `us-east-1`.
+
+#### [`PAPERLESS_S3_ACCESS_KEY=<key>`](#PAPERLESS_S3_ACCESS_KEY) {#PAPERLESS_S3_ACCESS_KEY}
+
+: The access key ID for S3 authentication.
+
+    Required for S3 storage unless using IAM roles or other authentication methods.
+
+#### [`PAPERLESS_S3_SECRET_KEY=<secret>`](#PAPERLESS_S3_SECRET_KEY) {#PAPERLESS_S3_SECRET_KEY}
+
+: The secret access key for S3 authentication.
+
+    Required for S3 storage unless using IAM roles or other authentication methods.
+
+### Storage Migration
+
+When switching storage backends, existing documents need to be migrated. This is not done automatically to prevent data loss.
+
+!!! warning
+
+    Always backup your data before attempting storage migration.
+
+To migrate from local to S3 storage:
+
+1. Ensure S3 configuration is complete and tested
+2. Stop Paperless
+3. Use the AWS CLI or similar tools to upload your media directory to S3
+4. Update your configuration to use `PAPERLESS_STORAGE_BACKEND=s3`
+5. Start Paperless
+
+To migrate from S3 to local storage:
+
+1. Stop Paperless
+2. Use the AWS CLI or similar tools to download your documents from S3
+3. Update your configuration to use `PAPERLESS_STORAGE_BACKEND=local`
+4. Start Paperless
 
 ## Logging
 

@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from documents.models import Document
 from documents.models import PaperlessTask
+from documents.storage import get_storage_backend
 from paperless.config import GeneralConfig
 
 
@@ -75,53 +76,62 @@ def check_sanity(*, progress=False, scheduled=True) -> SanityCheckMessages:
     )
     messages = SanityCheckMessages()
 
-    present_files = {
-        x.resolve() for x in Path(settings.MEDIA_ROOT).glob("**/*") if not x.is_dir()
-    }
-
-    lockfile = Path(settings.MEDIA_LOCK).resolve()
-    if lockfile in present_files:
-        present_files.remove(lockfile)
-
+    # Get storage backend
+    storage = get_storage_backend()
+    
+    # Get all files/objects from storage
+    present_files = set(storage.list_keys())
+    
+    # Remove known non-document files
+    # Note: media.lock is a local file for process coordination, not stored in S3
+    # For local storage, we might see it in the file list
     general_config = GeneralConfig()
     app_logo = general_config.app_logo or settings.APP_LOGO
     if app_logo:
-        logo_file = Path(settings.MEDIA_ROOT / Path(app_logo.lstrip("/"))).resolve()
-        if logo_file in present_files:
-            present_files.remove(logo_file)
+        # Convert app logo path to storage key format
+        logo_key = app_logo.lstrip("/")
+        if logo_key in present_files:
+            present_files.remove(logo_key)
 
     for doc in tqdm(Document.global_objects.all(), disable=not progress):
         # Check sanity of the thumbnail
-        thumbnail_path: Final[Path] = Path(doc.thumbnail_path).resolve()
-        if not thumbnail_path.exists() or not thumbnail_path.is_file():
-            messages.error(doc.pk, "Thumbnail of document does not exist.")
+        thumbnail = doc.thumbnail_file
+        if thumbnail and thumbnail.key:
+            if not thumbnail.exists:
+                messages.error(doc.pk, "Thumbnail of document does not exist.")
+            else:
+                if thumbnail.key in present_files:
+                    present_files.remove(thumbnail.key)
+                try:
+                    _ = thumbnail.read()
+                except (OSError, FileNotFoundError) as e:
+                    messages.error(doc.pk, f"Cannot read thumbnail file of document: {e}")
         else:
-            if thumbnail_path in present_files:
-                present_files.remove(thumbnail_path)
-            try:
-                _ = thumbnail_path.read_bytes()
-            except OSError as e:
-                messages.error(doc.pk, f"Cannot read thumbnail file of document: {e}")
+            messages.error(doc.pk, "Document has no thumbnail storage key.")
 
         # Check sanity of the original file
         # TODO: extract method
-        source_path: Final[Path] = Path(doc.source_path).resolve()
-        if not source_path.exists() or not source_path.is_file():
-            messages.error(doc.pk, "Original of document does not exist.")
-        else:
-            if source_path in present_files:
-                present_files.remove(source_path)
-            try:
-                checksum = hashlib.md5(source_path.read_bytes()).hexdigest()
-            except OSError as e:
-                messages.error(doc.pk, f"Cannot read original file of document: {e}")
+        source = doc.source_file
+        if source and source.key:
+            if not source.exists:
+                messages.error(doc.pk, "Original of document does not exist.")
             else:
-                if checksum != doc.checksum:
-                    messages.error(
-                        doc.pk,
-                        "Checksum mismatch. "
-                        f"Stored: {doc.checksum}, actual: {checksum}.",
-                    )
+                if source.key in present_files:
+                    present_files.remove(source.key)
+                try:
+                    content = source.read()
+                    checksum = hashlib.md5(content).hexdigest()
+                except (OSError, FileNotFoundError) as e:
+                    messages.error(doc.pk, f"Cannot read original file of document: {e}")
+                else:
+                    if checksum != doc.checksum:
+                        messages.error(
+                            doc.pk,
+                            "Checksum mismatch. "
+                            f"Stored: {doc.checksum}, actual: {checksum}.",
+                        )
+        else:
+            messages.error(doc.pk, "Document has no source file storage key.")
 
         # Check sanity of the archive file.
         if doc.archive_checksum is not None and doc.archive_filename is None:
@@ -135,27 +145,31 @@ def check_sanity(*, progress=False, scheduled=True) -> SanityCheckMessages:
                 "Document has an archive file, but its checksum is missing.",
             )
         elif doc.has_archive_version:
-            archive_path: Final[Path] = Path(doc.archive_path).resolve()
-            if not archive_path.exists() or not archive_path.is_file():
-                messages.error(doc.pk, "Archived version of document does not exist.")
-            else:
-                if archive_path in present_files:
-                    present_files.remove(archive_path)
-                try:
-                    checksum = hashlib.md5(archive_path.read_bytes()).hexdigest()
-                except OSError as e:
-                    messages.error(
-                        doc.pk,
-                        f"Cannot read archive file of document : {e}",
-                    )
+            archive = doc.archive_file
+            if archive and archive.key:
+                if not archive.exists:
+                    messages.error(doc.pk, "Archived version of document does not exist.")
                 else:
-                    if checksum != doc.archive_checksum:
+                    if archive.key in present_files:
+                        present_files.remove(archive.key)
+                    try:
+                        content = archive.read()
+                        checksum = hashlib.md5(content).hexdigest()
+                    except (OSError, FileNotFoundError) as e:
                         messages.error(
                             doc.pk,
-                            "Checksum mismatch of archived document. "
-                            f"Stored: {doc.archive_checksum}, "
-                            f"actual: {checksum}.",
+                            f"Cannot read archive file of document : {e}",
                         )
+                    else:
+                        if checksum != doc.archive_checksum:
+                            messages.error(
+                                doc.pk,
+                                "Checksum mismatch of archived document. "
+                                f"Stored: {doc.archive_checksum}, "
+                                f"actual: {checksum}.",
+                            )
+            else:
+                messages.error(doc.pk, "Document has archive version but no storage key.")
 
         # other document checks
         if not doc.content:
